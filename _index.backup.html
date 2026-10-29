@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SurveyBet</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn .3s ease-out}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;transition:all .15s}
+.card:hover{box-shadow:0 2px 16px rgba(0,0,0,.05)}
+input:focus,textarea:focus,select:focus{outline:none;box-shadow:0 0 0 2px rgba(59,130,246,.3)}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useMemo,useCallback} = React;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LOCAL DATABASE — stored in localStorage, persists across sessions
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const DB_KEY = 'surveybet_db';
+
+function loadDB() {
+  try {
+    const raw = localStorage.getItem(DB_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch(e) {}
+  return { users: [], surveys: [], bets: [], oddsHistory: [], nextUserId: 1, nextSurveyId: 1, nextBetId: 1 };
+}
+
+function saveDB(db) {
+  localStorage.setItem(DB_KEY, JSON.stringify(db));
+}
+
+function getDB() { return loadDB(); }
+
+function dbRegister(email, password, name) {
+  const db = getDB();
+  if (db.users.find(function(u){ return u.email === email; })) return { error: 'Email already registered' };
+  if (password.length < 6) return { error: 'Password must be 6+ characters' };
+  var role = db.users.length === 0 ? 'admin' : 'user';
+  var balance = role === 'admin' ? 999999 : 1000;
+  var user = { id: db.nextUserId++, email: email, password: password, name: name, role: role, balance: balance, createdAt: new Date().toISOString() };
+  db.users.push(user);
+  saveDB(db);
+  return { user: { id: user.id, email: user.email, name: user.name, role: user.role, balance: user.balance } };
+}
+
+function dbLogin(email, password) {
+  var db = getDB();
+  var user = db.users.find(function(u){ return u.email === email && u.password === password; });
+  if (!user) return { error: 'Invalid email or password' };
+  return { user: { id: user.id, email: user.email, name: user.name, role: user.role, balance: user.balance } };
+}
+
+function dbGetUser(userId) {
+  var db = getDB();
+  var u = db.users.find(function(x){ return x.id === userId; });
+  if (!u) return null;
+  return { id: u.id, email: u.email, name: u.name, role: u.role, balance: u.balance };
+}
+
+function dbCreateSurvey(userId, question, category, description, threshold, deadline) {
+  var db = getDB();
+  var survey = {
+    id: db.nextSurveyId++, question: question, category: category, description: description || '',
+    threshold: threshold, poolSize: 0, yesOdds: 0.5, totalBets: 0,
+    deadline: deadline, surveyFirm: '', status: 'pending', result: '',
+    createdBy: userId, createdAt: new Date().toISOString()
+  };
+  db.surveys.push(survey);
+  db.oddsHistory.push({ surveyId: survey.id, yesOdds: 0.5, time: new Date().toISOString() });
+  saveDB(db);
+  return survey;
+}
+
+function dbGetSurveys(filter) {
+  var db = getDB();
+  var list = db.surveys;
+  if (filter && filter.status) {
+    var statuses = filter.status.split(',');
+    list = list.filter(function(s){ return statuses.indexOf(s.status) >= 0; });
+  }
+  if (filter && filter.category && filter.category !== 'All') {
+    list = list.filter(function(s){ return s.category === filter.category; });
+  }
+  if (filter && filter.search) {
+    var q = filter.search.toLowerCase();
+    list = list.filter(function(s){ return s.question.toLowerCase().indexOf(q) >= 0; });
+  }
+  return list.map(function(s) {
+    var creator = db.users.find(function(u){ return u.id === s.createdBy; });
+    return Object.assign({}, s, { creatorName: creator ? creator.name : 'Unknown' });
+  });
+}
+
+function dbGetSurvey(id) {
+  var db = getDB();
+  var s = db.surveys.find(function(x){ return x.id === id; });
+  if (!s) return null;
+  var history = db.oddsHistory.filter(function(h){ return h.surveyId === id; });
+  var creator = db.users.find(function(u){ return u.id === s.createdBy; });
+  return Object.assign({}, s, { history: history, creatorName: creator ? creator.name : 'Unknown' });
+}
+
+function dbPlaceBet(userId, surveyId, side, amount) {
+  var db = getDB();
+  var user = db.users.find(function(u){ return u.id === userId; });
+  var survey = db.surveys.find(function(s){ return s.id === surveyId; });
+  if (!user) return { error: 'User not found' };
+  if (!survey) return { error: 'Survey not found' };
+  if (survey.status !== 'active' && survey.status !== 'funded') return { error: 'Survey not active' };
+  if (user.balance < amount) return { error: 'Insufficient balance' };
+  if (amount <= 0) return { error: 'Amount must be positive' };
+
+  user.balance -= amount;
+  var bet = { id: db.nextBetId++, userId: userId, surveyId: surveyId, side: side, amount: amount, oddsAtBet: survey.yesOdds, createdAt: new Date().toISOString() };
+  db.bets.push(bet);
+
+  // Recalc odds
+  var yesTotal = 0, noTotal = 0;
+  db.bets.filter(function(b){ return b.surveyId === surveyId; }).forEach(function(b) {
+    if (b.side === 'yes') yesTotal += b.amount;
+    else noTotal += b.amount;
+  });
+  var total = yesTotal + noTotal;
+  survey.yesOdds = total > 0 ? Math.max(0.02, Math.min(0.98, yesTotal / total)) : 0.5;
+  survey.poolSize = total;
+  survey.totalBets = db.bets.filter(function(b){ return b.surveyId === surveyId; }).length;
+
+  db.oddsHistory.push({ surveyId: surveyId, yesOdds: survey.yesOdds, time: new Date().toISOString() });
+
+  if (total >= survey.threshold && survey.status === 'active') {
+    survey.status = 'funded';
+  }
+
+  saveDB(db);
+  return { success: true, newOdds: survey.yesOdds, balance: user.balance };
+}
+
+function dbGetMyBets(userId) {
+  var db = getDB();
+  return db.bets.filter(function(b){ return b.userId === userId; }).map(function(b) {
+    var s = db.surveys.find(function(x){ return x.id === b.surveyId; });
+    return Object.assign({}, b, {
+      question: s ? s.question : '', category: s ? s.category : '',
+      currentOdds: s ? s.yesOdds : 0.5, surveyStatus: s ? s.status : '', result: s ? s.result : ''
+    });
+  }).reverse();
+}
+
+function dbAdminUpdate(surveyId, updates) {
+  var db = getDB();
+  var s = db.surveys.find(function(x){ return x.id === surveyId; });
+  if (!s) return { error: 'Not found' };
+
+  if (updates.status) s.status = updates.status;
+  if (updates.surveyFirm) s.surveyFirm = updates.surveyFirm;
+  if (updates.result) {
+    s.result = updates.result;
+    s.status = 'resolved';
+    // Pay winners
+    var won = updates.result.toLowerCase().indexOf('yes') === 0 ? 'yes' : 'no';
+    var surveyBets = db.bets.filter(function(b){ return b.surveyId === surveyId; });
+    var winnerBets = surveyBets.filter(function(b){ return b.side === won; });
+    var winnerTotal = winnerBets.reduce(function(sum, b){ return sum + b.amount; }, 0);
+    if (winnerTotal > 0 && s.poolSize > 0) {
+      winnerBets.forEach(function(b) {
+        var payout = (b.amount / winnerTotal) * s.poolSize * 0.97;
+        var u = db.users.find(function(x){ return x.id === b.userId; });
+        if (u) u.balance += payout;
+      });
+    }
+  }
+
+  saveDB(db);
+  return s;
+}
+
+function dbGetStats() {
+  var db = getDB();
+  var active = db.surveys.filter(function(s){ return s.status === 'active' || s.status === 'funded'; });
+  return {
+    totalPool: active.reduce(function(sum, s){ return sum + (s.poolSize || 0); }, 0),
+    activeSurveys: active.length,
+    totalBettors: db.bets.map(function(b){ return b.userId; }).filter(function(v,i,a){ return a.indexOf(v)===i; }).length,
+    resolved: db.surveys.filter(function(s){ return s.status === 'resolved'; }).length,
+    users: db.users.length,
+    totalSurveys: db.surveys.length,
+    totalBets: db.bets.length,
+    pending: db.surveys.filter(function(s){ return s.status === 'pending'; }).length
+  };
+}
+
+function dbGetAllUsers() {
+  var db = getDB();
+  return db.users.map(function(u){ return { id: u.id, email: u.email, name: u.name, role: u.role, balance: u.balance, createdAt: u.createdAt }; });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SESSION — logged in user stored in sessionStorage
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function getSession() {
+  try { var s = sessionStorage.getItem('surveybet_user'); return s ? JSON.parse(s) : null; } catch(e){ return null; }
+}
+function setSession(user) {
+  if (user) sessionStorage.setItem('surveybet_user', JSON.stringify(user));
+  else sessionStorage.removeItem('surveybet_user');
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ICONS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var I = function(props) {
+  var n=props.n, s=props.s||16, c=props.c||'';
+  var p={
+    target:React.createElement('g',null,React.createElement('circle',{cx:12,cy:12,r:10}),React.createElement('circle',{cx:12,cy:12,r:6}),React.createElement('circle',{cx:12,cy:12,r:2})),
+    home:React.createElement('g',null,React.createElement('path',{d:'M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z'}),React.createElement('polyline',{points:'9 22 9 12 15 12 15 22'})),
+    chart:React.createElement('g',null,React.createElement('line',{x1:18,y1:20,x2:18,y2:10}),React.createElement('line',{x1:12,y1:20,x2:12,y2:4}),React.createElement('line',{x1:6,y1:20,x2:6,y2:14})),
+    plus:React.createElement('g',null,React.createElement('line',{x1:12,y1:5,x2:12,y2:19}),React.createElement('line',{x1:5,y1:12,x2:19,y2:12})),
+    wallet:React.createElement('g',null,React.createElement('path',{d:'M21 12V7H5a2 2 0 010-4h14v4'}),React.createElement('path',{d:'M3 5v14a2 2 0 002 2h16v-5'}),React.createElement('path',{d:'M18 12a2 2 0 000 4h4v-4z'})),
+    clock:React.createElement('g',null,React.createElement('circle',{cx:12,cy:12,r:10}),React.createElement('polyline',{points:'12 6 12 12 16 14'})),
+    users:React.createElement('g',null,React.createElement('path',{d:'M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2'}),React.createElement('circle',{cx:9,cy:7,r:4})),
+    dollar:React.createElement('g',null,React.createElement('line',{x1:12,y1:1,x2:12,y2:23}),React.createElement('path',{d:'M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6'})),
+    check:React.createElement('g',null,React.createElement('path',{d:'M22 11.08V12a10 10 0 11-5.93-9.14'}),React.createElement('polyline',{points:'22 4 12 14.01 9 11.01'})),
+    arrow:React.createElement('g',null,React.createElement('line',{x1:5,y1:12,x2:19,y2:12}),React.createElement('polyline',{points:'12 5 19 12 12 19'})),
+    search:React.createElement('g',null,React.createElement('circle',{cx:11,cy:11,r:8}),React.createElement('line',{x1:21,y1:21,x2:16.65,y2:16.65})),
+    x:React.createElement('g',null,React.createElement('line',{x1:18,y1:6,x2:6,y2:18}),React.createElement('line',{x1:6,y1:6,x2:18,y2:18})),
+    menu:React.createElement('g',null,React.createElement('line',{x1:3,y1:12,x2:21,y2:12}),React.createElement('line',{x1:3,y1:6,x2:21,y2:6}),React.createElement('line',{x1:3,y1:18,x2:21,y2:18})),
+    globe:React.createElement('g',null,React.createElement('circle',{cx:12,cy:12,r:10}),React.createElement('line',{x1:2,y1:12,x2:22,y2:12}),React.createElement('path',{d:'M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z'})),
+    zap:React.createElement('polygon',{points:'13 2 3 14 12 14 11 22 21 10 12 10 13 2'}),
+    shield:React.createElement('path',{d:'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'}),
+    award:React.createElement('g',null,React.createElement('circle',{cx:12,cy:8,r:7}),React.createElement('polyline',{points:'8.21 13.89 7 23 12 20 17 23 15.79 13.88'})),
+    info:React.createElement('g',null,React.createElement('circle',{cx:12,cy:12,r:10}),React.createElement('line',{x1:12,y1:16,x2:12,y2:12}),React.createElement('line',{x1:12,y1:8,x2:12.01,y2:8})),
+    login:React.createElement('g',null,React.createElement('path',{d:'M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4'}),React.createElement('polyline',{points:'10 17 15 12 10 7'}),React.createElement('line',{x1:15,y1:12,x2:3,y2:12})),
+    logout:React.createElement('g',null,React.createElement('path',{d:'M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4'}),React.createElement('polyline',{points:'16 17 21 12 16 7'}),React.createElement('line',{x1:21,y1:12,x2:9,y2:12})),
+    settings:React.createElement('g',null,React.createElement('circle',{cx:12,cy:12,r:3}),React.createElement('path',{d:'M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z'})),
+    trash:React.createElement('g',null,React.createElement('polyline',{points:'3 6 5 6 21 6'}),React.createElement('path',{d:'M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2'}))
+  };
+  return React.createElement('svg',{width:s,height:s,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2,strokeLinecap:'round',strokeLinejoin:'round',className:c},p[n]);
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   UTILITIES
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var fmt = function(n) { return n>=1e6?'$'+(n/1e6).toFixed(1)+'M':n>=1e3?'$'+(n/1e3).toFixed(0)+'K':'$'+Math.round(n); };
+var pct = function(n) { return (n*100).toFixed(0)+'%'; };
+var dLeft = function(d) { return Math.max(0, Math.ceil((new Date(d)-Date.now())/864e5)); };
+var CATS = ["All","Politics","Economy","Technology","Health","Culture","Environment","Sports"];
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SMALL COMPONENTS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var Badge = function(props) {
+  var m = {blue:"bg-blue-50 text-blue-700 border border-blue-200",green:"bg-green-50 text-green-700 border border-green-200",red:"bg-red-50 text-red-700 border border-red-200",purple:"bg-purple-50 text-purple-700 border border-purple-200",gray:"bg-gray-100 text-gray-600 border border-gray-200",yellow:"bg-yellow-50 text-yellow-700 border border-yellow-200"};
+  return <span className={"inline-block px-2 py-0.5 rounded-full text-xs font-medium "+(m[props.c]||m.blue)}>{props.children}</span>;
+};
+
+var ProgBar = function(props) {
+  var p = Math.min(100, (props.val||0)/(props.max||1)*100);
+  var h = props.h || 'h-2';
+  return <div className={"w-full bg-gray-100 rounded-full "+h+" overflow-hidden"}><div className={h+" rounded-full transition-all duration-700 "+(p>=100?"bg-green-500":p>60?"bg-blue-500":"bg-blue-400")} style={{width:p+'%'}}/></div>;
+};
+
+var Odds = function(props) {
+  var y = props.yes || 0.5;
+  var big = props.big;
+  return <div className="flex items-center gap-3 flex-wrap">
+    <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-full bg-green-500"/><span className={(big?"text-2xl":"text-lg")+" font-bold text-green-600"}>Yes {pct(y)}</span></div>
+    <div className="w-px h-5 bg-gray-200"/>
+    <div className="flex items-center gap-1.5"><div className="w-3 h-3 rounded-full bg-red-500"/><span className={(big?"text-2xl":"text-lg")+" font-bold text-red-600"}>No {pct(1-y)}</span></div>
+  </div>;
+};
+
+var Spark = function(props) {
+  var data = props.data, color = props.color || '#10b981', h = props.h || 40;
+  if (!data || data.length < 2) return <div style={{height:h}} className="bg-gray-50 rounded"/>;
+  var vals = data.map(function(d){ return d.yesOdds || 0.5; });
+  var mn = Math.min.apply(null, vals) - 0.03, mx = Math.max.apply(null, vals) + 0.03, rng = mx - mn || 1;
+  var pts = vals.map(function(v, i){ return (i/(vals.length-1))*200 + ',' + (h - ((v-mn)/rng)*(h-4) - 2); }).join(' ');
+  var uid = 'sp' + color.replace('#','');
+  return <svg viewBox={"0 0 200 "+h} style={{width:'100%',height:h}} preserveAspectRatio="none">
+    <defs><linearGradient id={uid} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity=".2"/><stop offset="100%" stopColor={color} stopOpacity="0"/></linearGradient></defs>
+    <polygon points={"0,"+h+" "+pts+" 200,"+h} fill={"url(#"+uid+")"}/>
+    <polyline points={pts} fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   NAVIGATION
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var Nav = function(props) {
+  var page=props.page, go=props.go, user=props.user, onLogout=props.onLogout;
+  var [mob,setMob] = useState(false);
+  var links = [{id:"home",l:"Home",i:"home"},{id:"market",l:"Markets",i:"chart"},{id:"create",l:"Create",i:"plus"},{id:"wallet",l:"Portfolio",i:"wallet"}];
+  if (user && user.role === 'admin') links.push({id:"admin",l:"Admin",i:"settings"});
+  return <nav className="fixed top-0 left-0 right-0 z-50 bg-white border-b border-gray-200">
+    <div className="max-w-6xl mx-auto px-4">
+      <div className="flex items-center justify-between h-14">
+        <div className="flex items-center gap-2 cursor-pointer" onClick={function(){go('home')}}>
+          <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center"><I n="target" s={16} c="text-white"/></div>
+          <span className="text-lg font-bold text-gray-900">SurveyBet</span>
+        </div>
+        <div className="hidden md:flex items-center gap-1">
+          {links.map(function(l){ return <button key={l.id} onClick={function(){go(l.id)}} className={"flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition "+(page===l.id?"bg-blue-50 text-blue-600":"text-gray-500 hover:text-gray-900 hover:bg-gray-50")}><I n={l.i} s={15}/>{l.l}</button>; })}
+        </div>
+        <div className="hidden md:flex items-center gap-3">
+          {user ? <>
+            <div className="flex items-center gap-2 bg-gray-50 rounded-lg px-3 py-1.5 border border-gray-200">
+              <I n="wallet" s={14} c="text-green-600"/><span className="text-sm font-semibold text-green-600">{fmt(user.balance)}</span>
+            </div>
+            <span className="text-sm text-gray-500">{user.name}</span>
+            {user.role==='admin'&&<Badge c="blue">Admin</Badge>}
+            <button onClick={onLogout} className="text-gray-400 hover:text-gray-600"><I n="logout" s={18}/></button>
+          </> : <>
+            <button onClick={function(){go('login')}} className="text-sm text-gray-600 hover:text-gray-900 font-medium">Sign In</button>
+            <button onClick={function(){go('register')}} className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition">Sign Up</button>
+          </>}
+        </div>
+        <button className="md:hidden text-gray-500" onClick={function(){setMob(!mob)}}><I n={mob?"x":"menu"} s={24}/></button>
+      </div>
+    </div>
+    {mob && <div className="md:hidden px-4 py-3 space-y-1 bg-white border-t border-gray-100">
+      {links.map(function(l){ return <button key={l.id} onClick={function(){go(l.id);setMob(false);}} className={"flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm font-medium "+(page===l.id?"bg-blue-50 text-blue-600":"text-gray-500")}><I n={l.i} s={16}/>{l.l}</button>; })}
+      {!user && <button onClick={function(){go('login');setMob(false);}} className="w-full text-left px-3 py-2.5 text-sm text-blue-600 font-medium">Sign In / Sign Up</button>}
+      {user && <button onClick={function(){onLogout();setMob(false);}} className="w-full text-left px-3 py-2.5 text-sm text-red-500">Sign Out ({user.name})</button>}
+    </div>}
+  </nav>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SURVEY CARD
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var SurveyCard = function(props) {
+  var s = props.s, onClick = props.onClick;
+  var funded = s.status === 'funded' || (s.poolSize || 0) >= s.threshold;
+  return <div onClick={onClick} className="card p-5 cursor-pointer fade-in">
+    <div className="flex items-start justify-between mb-3">
+      <div className="flex gap-2 flex-wrap">
+        <Badge c="purple">{s.category}</Badge>
+        {s.status==='pending' && <Badge c="yellow">Pending</Badge>}
+        {funded && s.status!=='pending' && s.status!=='resolved' && <Badge c="green">Funded</Badge>}
+        {s.status==='resolved' && <Badge c="gray">Resolved</Badge>}
+      </div>
+      <span className="text-xs text-gray-400 flex items-center gap-1 flex-shrink-0"><I n="clock" s={11}/>{dLeft(s.deadline)}d</span>
+    </div>
+    <h3 className="text-gray-900 font-semibold text-sm leading-snug mb-3">{s.question}</h3>
+    {s.history && s.history.length >= 2 && <div className="mb-3"><Spark data={s.history} color={(s.yesOdds||.5) > .5 ? '#10b981' : '#ef4444'}/></div>}
+    <Odds yes={s.yesOdds || .5}/>
+    <div className="mt-4 space-y-2">
+      <div className="flex justify-between text-xs text-gray-400"><span>Pool: {fmt(s.poolSize||0)}</span><span>Goal: {fmt(s.threshold)}</span></div>
+      <ProgBar val={s.poolSize||0} max={s.threshold}/>
+    </div>
+    <div className="flex items-center justify-between mt-3 pt-3 border-t border-gray-100">
+      <span className="flex items-center gap-1 text-xs text-gray-400"><I n="users" s={11}/>{s.totalBets||0} bets</span>
+      {s.surveyFirm && <span className="flex items-center gap-1 text-xs text-gray-400"><I n="shield" s={11}/>{s.surveyFirm}</span>}
+    </div>
+  </div>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   AUTH PAGE
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var AuthPage = function(props) {
+  var mode=props.mode, go=props.go, onAuth=props.onAuth;
+  var [email,setEmail]=useState('');
+  var [pass,setPass]=useState('');
+  var [name,setName]=useState('');
+  var [err,setErr]=useState('');
+  var isLogin = mode === 'login';
+  var submit = function(e) {
+    e.preventDefault(); setErr('');
+    var result = isLogin ? dbLogin(email, pass) : dbRegister(email, pass, name);
+    if (result.error) { setErr(result.error); return; }
+    setSession(result.user);
+    onAuth(result.user);
+    go('home');
+  };
+  return <div className="max-w-md mx-auto px-4 pt-28 pb-16 fade-in">
+    <div className="text-center mb-8">
+      <div className="w-12 h-12 rounded-xl bg-blue-600 flex items-center justify-center mx-auto mb-4"><I n="target" s={24} c="text-white"/></div>
+      <h1 className="text-2xl font-bold text-gray-900">{isLogin ? 'Welcome back' : 'Create your account'}</h1>
+      <p className="text-gray-500 mt-1 text-sm">{isLogin ? 'Sign in to place bets' : 'Join SurveyBet — first signup becomes Admin!'}</p>
+    </div>
+    <form onSubmit={submit} className="card p-6 space-y-4">
+      {!isLogin && <div><label className="text-sm font-medium text-gray-700 mb-1 block">Name</label><input value={name} onChange={function(e){setName(e.target.value)}} className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm" placeholder="Your name"/></div>}
+      <div><label className="text-sm font-medium text-gray-700 mb-1 block">Email</label><input type="email" value={email} onChange={function(e){setEmail(e.target.value)}} className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm" placeholder="you@example.com"/></div>
+      <div><label className="text-sm font-medium text-gray-700 mb-1 block">Password</label><input type="password" value={pass} onChange={function(e){setPass(e.target.value)}} className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm" placeholder={isLogin?"Your password":"6+ characters"}/></div>
+      {err && <p className="text-red-600 text-sm bg-red-50 p-3 rounded-lg">{err}</p>}
+      <button type="submit" className="w-full bg-blue-600 hover:bg-blue-500 text-white py-2.5 rounded-xl text-sm font-semibold transition">{isLogin ? 'Sign In' : 'Create Account'}</button>
+      <p className="text-center text-sm text-gray-500">
+        {isLogin
+          ? <span>No account? <button type="button" onClick={function(){go('register')}} className="text-blue-600 font-medium">Sign up</button></span>
+          : <span>Have an account? <button type="button" onClick={function(){go('login')}} className="text-blue-600 font-medium">Sign in</button></span>}
+      </p>
+    </form>
+    <p className="text-center text-xs text-gray-400 mt-4">{loadDB().users.length === 0 ? 'The first user to sign up becomes Admin with full control.' : ''}</p>
+  </div>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   HOME
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var HomePage = function(props) {
+  var go=props.go, setSel=props.setSel, user=props.user;
+  var stats = dbGetStats();
+  var surveys = dbGetSurveys({status:'active,funded'}).slice(0,6);
+  var st=[{l:"Total Pool",v:fmt(stats.totalPool),i:"dollar",c:"text-green-600"},{l:"Active",v:stats.activeSurveys,i:"chart",c:"text-blue-600"},{l:"Bettors",v:stats.totalBettors,i:"users",c:"text-purple-600"},{l:"Resolved",v:stats.resolved,i:"check",c:"text-yellow-600"}];
+  return <div>
+    <section className="relative pt-28 pb-16 px-4 bg-white">
+      <div className="max-w-4xl mx-auto text-center fade-in">
+        <div className="inline-flex items-center gap-2 rounded-full px-4 py-1.5 mb-6 bg-blue-50 border border-blue-100"><I n="zap" s={14} c="text-blue-600"/><span className="text-sm text-blue-600 font-medium">Prediction Markets Meet Real Surveys</span></div>
+        <h1 className="text-4xl sm:text-5xl font-extrabold text-gray-900 leading-tight mb-6">Bet on What People<br/><span className="text-blue-600">Actually Think</span></h1>
+        <p className="text-lg text-gray-500 max-w-2xl mx-auto mb-10">Fund real public opinion surveys by betting on outcomes. When the pool hits its goal, a professional firm runs the survey. Truth pays.</p>
+        <div className="flex flex-col sm:flex-row gap-4 justify-center">
+          <button onClick={function(){go('market')}} className="inline-flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-xl font-semibold transition shadow-lg shadow-blue-200">Explore Markets <I n="arrow" s={16}/></button>
+          <button onClick={function(){user?go('create'):go('register')}} className="inline-flex items-center justify-center gap-2 bg-white hover:bg-gray-50 text-gray-700 px-8 py-3 rounded-xl font-semibold transition border border-gray-200">Create a Survey <I n="plus" s={16}/></button>
+        </div>
+      </div>
+    </section>
+    <section className="max-w-5xl mx-auto px-4 -mt-2 mb-14"><div className="grid grid-cols-2 md:grid-cols-4 gap-4">{st.map(function(s){ return <div key={s.l} className="card p-4 text-center"><I n={s.i} s={20} c={s.c+" mx-auto mb-2"}/><div className="text-2xl font-bold text-gray-900">{s.v}</div><div className="text-xs text-gray-400 mt-1">{s.l}</div></div>;})}</div></section>
+    {surveys.length > 0 && <section className="max-w-5xl mx-auto px-4 mb-16">
+      <div className="flex items-center justify-between mb-6"><h2 className="text-xl font-bold text-gray-900">Active Markets</h2><button onClick={function(){go('market')}} className="text-sm text-blue-600 hover:text-blue-500 flex items-center gap-1">View All <I n="arrow" s={14}/></button></div>
+      <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">{surveys.map(function(s){ return <SurveyCard key={s.id} s={s} onClick={function(){setSel(s.id);go('detail');}}/>; })}</div>
+    </section>}
+    <section className="max-w-5xl mx-auto px-4 mb-16"><h2 className="text-xl font-bold text-gray-900 text-center mb-10">How It Works</h2>
+      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-5">
+        {[{i:"globe",t:"Question Proposed",d:"Anyone submits a yes/no opinion question. Admin reviews it."},{i:"dollar",t:"Crowd Bets",d:"Once approved, users bet YES or NO. Odds shift with the money."},{i:"target",t:"Threshold Hit",d:"Pool reaches the goal — a real survey firm is hired."},{i:"award",t:"Truth Pays",d:"Survey results come in. Winners get paid. 3% platform fee."}].map(function(s,i){ return <div key={i} className="card p-5"><div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center mb-4"><I n={s.i} s={20} c="text-blue-600"/></div><div className="text-xs text-gray-400 font-mono mb-2">STEP {i+1}</div><h3 className="text-gray-900 font-semibold mb-2">{s.t}</h3><p className="text-sm text-gray-500 leading-relaxed">{s.d}</p></div>; })}
+      </div>
+    </section>
+  </div>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MARKET PAGE
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var MarketPage = function(props) {
+  var go=props.go, setSel=props.setSel;
+  var [cat,setCat]=useState('All');
+  var [q,setQ]=useState('');
+  var [sort,setSort]=useState('pool');
+  var surveys = dbGetSurveys({status:'active,funded', category:cat!=='All'?cat:undefined, search:q||undefined});
+  var sorted = useMemo(function(){
+    var list = surveys.slice();
+    if(sort==='pool') list.sort(function(a,b){return (b.poolSize||0)-(a.poolSize||0);});
+    if(sort==='bets') list.sort(function(a,b){return (b.totalBets||0)-(a.totalBets||0);});
+    if(sort==='deadline') list.sort(function(a,b){return new Date(a.deadline)-new Date(b.deadline);});
+    if(sort==='new') list.sort(function(a,b){return new Date(b.createdAt)-new Date(a.createdAt);});
+    return list;
+  },[surveys,sort]);
+  return <div className="max-w-5xl mx-auto px-4 pt-20 pb-16">
+    <div className="mb-8"><h1 className="text-2xl font-bold text-gray-900 mb-1">Survey Markets</h1><p className="text-gray-500 text-sm">Bet on what people think. Fund real answers.</p></div>
+    <div className="flex flex-col md:flex-row gap-3 mb-5">
+      <div className="relative flex-1"><div className="absolute left-3 top-1/2 transform -translate-y-1/2"><I n="search" s={16} c="text-gray-400"/></div><input type="text" value={q} onChange={function(e){setQ(e.target.value)}} placeholder="Search surveys..." className="w-full border border-gray-200 rounded-xl pl-10 pr-4 py-2.5 text-sm bg-white"/></div>
+      <select value={sort} onChange={function(e){setSort(e.target.value)}} className="border border-gray-200 rounded-xl px-4 py-2.5 text-sm bg-white cursor-pointer"><option value="pool">Pool Size</option><option value="bets">Activity</option><option value="deadline">Deadline</option><option value="new">Newest</option></select>
+    </div>
+    <div className="flex gap-2 flex-wrap mb-6">{CATS.map(function(c){return <button key={c} onClick={function(){setCat(c)}} className={"px-3 py-1 rounded-full text-sm font-medium transition "+(cat===c?"bg-blue-600 text-white":"bg-white text-gray-500 hover:text-gray-700 border border-gray-200")}>{c}</button>;})}</div>
+    <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">{sorted.map(function(s){return <SurveyCard key={s.id} s={s} onClick={function(){setSel(s.id);go('detail');}}/>;})}</div>
+    {sorted.length===0 && <div className="text-center py-16 text-gray-400"><I n="search" s={32} c="mx-auto mb-3 opacity-50"/><p>No active surveys. Be the first to create one!</p></div>}
+  </div>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DETAIL PAGE
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var DetailPage = function(props) {
+  var surveyId=props.surveyId, go=props.go, user=props.user, refresh=props.refresh;
+  var [side,setSide]=useState('yes');
+  var [amt,setAmt]=useState('');
+  var [confirmOpen,setConfirmOpen]=useState(false);
+  var [err,setErr]=useState('');
+  var [tick,setTick]=useState(0);
+
+  var s = dbGetSurvey(surveyId);
+  if (!s) return <div className="max-w-5xl mx-auto px-4 pt-28 text-center text-gray-400">Survey not found.</div>;
+
+  var funded = s.status==='funded' || (s.poolSize||0) >= s.threshold;
+  var pay = amt ? (side==='yes' ? (parseFloat(amt)/Math.max(.02,s.yesOdds)).toFixed(2) : (parseFloat(amt)/Math.max(.02,1-s.yesOdds)).toFixed(2)) : '0.00';
+  var prog = Math.min(100,(s.poolSize||0)/s.threshold*100);
+
+  var doBet = function() {
+    if (!user) { go('login'); return; }
+    var res = dbPlaceBet(user.id, s.id, side, parseFloat(amt));
+    if (res.error) { setErr(res.error); return; }
+    setConfirmOpen(false); setAmt(''); setErr('');
+    refresh();
+    setTick(function(t){return t+1;});
+  };
+
+  // Chart
+  var BigChart = function() {
+    var data = s.history || [];
+    if (data.length < 2) return <div className="h-40 bg-gray-50 rounded-xl flex items-center justify-center text-gray-400 text-sm">Not enough data yet</div>;
+    var vals = data.map(function(d){return d.yesOdds;});
+    var H=160,W=500,mn=Math.min.apply(null,vals)-.05,mx=Math.max.apply(null,vals)+.05,rng=mx-mn||1;
+    var pts = vals.map(function(v,i){ return {x:40+(i/(vals.length-1))*(W-60), y:10+(1-(v-mn)/rng)*(H-40), v:v}; });
+    var ticks=[mn,mn+rng*.5,mx].map(function(v){return {v:v,y:10+(1-(v-mn)/rng)*(H-40)};});
+    return <svg viewBox={"0 0 "+W+" "+H} style={{width:'100%',height:'auto'}}>
+      <defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#3b82f6" stopOpacity=".12"/><stop offset="100%" stopColor="#3b82f6" stopOpacity="0"/></linearGradient></defs>
+      {ticks.map(function(t,i){return <g key={i}><line x1="40" y1={t.y} x2={W-20} y2={t.y} stroke="#f1f5f9" strokeWidth="1"/><text x="36" y={t.y+3} textAnchor="end" fill="#94a3b8" fontSize="10">{(t.v*100).toFixed(0)}%</text></g>;})}
+      <polygon points={"40,"+(H-25)+" "+pts.map(function(p){return p.x+','+p.y;}).join(' ')+" "+pts[pts.length-1].x+","+(H-25)} fill="url(#bg)"/>
+      <polyline points={pts.map(function(p){return p.x+','+p.y;}).join(' ')} fill="none" stroke="#3b82f6" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+      {pts.map(function(p,i){return <circle key={i} cx={p.x} cy={p.y} r="3" fill="white" stroke="#3b82f6" strokeWidth="2"/>;})}
+    </svg>;
+  };
+
+  return <div className="max-w-5xl mx-auto px-4 pt-20 pb-16 fade-in">
+    <button onClick={function(){go('market')}} className="text-sm text-gray-400 hover:text-gray-700 mb-5 inline-flex items-center gap-1">← Back to Markets</button>
+    <div className="grid lg:grid-cols-3 gap-5">
+      <div className="lg:col-span-2 space-y-5">
+        <div className="card p-6">
+          <div className="flex gap-2 flex-wrap mb-4"><Badge c="purple">{s.category}</Badge>{s.status==='pending'&&<Badge c="yellow">Pending</Badge>}{s.status==='resolved'&&<Badge c="gray">Resolved: {s.result}</Badge>}{funded&&s.status!=='resolved'&&s.status!=='pending'&&<Badge c="green">Funded</Badge>}{s.surveyFirm&&<Badge c="gray">{s.surveyFirm}</Badge>}</div>
+          <h1 className="text-xl font-bold text-gray-900 mb-5 leading-snug">{s.question}</h1>
+          <Odds yes={s.yesOdds||.5} big/>
+          {s.description&&<p className="mt-4 text-sm text-gray-500">{s.description}</p>}
+        </div>
+        <div className="card p-6"><h3 className="text-sm font-semibold text-gray-400 mb-3">YES Price History</h3><BigChart/></div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {[{l:"Pool",v:fmt(s.poolSize||0),i:"dollar"},{l:"Goal",v:fmt(s.threshold),i:"target"},{l:"Bets",v:(s.totalBets||0),i:"users"},{l:"Days Left",v:dLeft(s.deadline),i:"clock"}].map(function(x){return <div key={x.l} className="card p-4"><I n={x.i} s={16} c="text-gray-400 mb-1"/><div className="text-lg font-bold text-gray-900">{x.v}</div><div className="text-xs text-gray-400">{x.l}</div></div>;})}
+        </div>
+        <div className="card p-5">
+          <div className="flex justify-between items-center mb-2"><span className="text-sm font-semibold text-gray-400">Funding</span><span className="text-sm font-bold text-gray-900">{prog.toFixed(1)}%</span></div>
+          <ProgBar val={s.poolSize||0} max={s.threshold} h="h-3"/>
+        </div>
+      </div>
+      {/* Bet Panel */}
+      <div><div className="card p-5 sticky top-16">
+        <h3 className="text-lg font-bold text-gray-900 mb-4">Place Your Bet</h3>
+        {(s.status!=='active'&&s.status!=='funded') ? <p className="text-sm text-gray-400 text-center py-6">Betting not available ({s.status}).</p> : <>
+        <div className="grid grid-cols-2 gap-2 mb-4">
+          <button onClick={function(){setSide('yes')}} className={"py-3 rounded-xl text-sm font-semibold transition "+(side==='yes'?"bg-green-600 text-white shadow-md":"bg-gray-100 text-gray-500 hover:bg-gray-200")}>YES {pct(s.yesOdds||.5)}</button>
+          <button onClick={function(){setSide('no')}} className={"py-3 rounded-xl text-sm font-semibold transition "+(side==='no'?"bg-red-600 text-white shadow-md":"bg-gray-100 text-gray-500 hover:bg-gray-200")}>NO {pct(1-(s.yesOdds||.5))}</button>
+        </div>
+        <div className="mb-4">
+          <label className="text-xs text-gray-400 mb-1 block">Amount ($)</label>
+          <input type="number" value={amt} onChange={function(e){setAmt(e.target.value)}} placeholder="0.00" className="w-full border border-gray-200 rounded-xl px-4 py-3 text-gray-900 text-lg font-semibold"/>
+          <div className="flex gap-2 mt-2">{[10,50,100,500].map(function(v){return <button key={v} onClick={function(){setAmt(String(v))}} className="flex-1 bg-gray-50 hover:bg-gray-100 text-gray-500 text-xs py-1.5 rounded-lg border border-gray-200">${v}</button>;})}</div>
+        </div>
+        <div className="bg-gray-50 rounded-xl p-3 mb-4 space-y-2 text-sm">
+          <div className="flex justify-between"><span className="text-gray-400">Bet</span><span className="text-gray-900 font-medium">{side.toUpperCase()} · ${amt||'0'}</span></div>
+          <div className="flex justify-between"><span className="text-gray-400">Odds</span><span className="text-gray-900">{side==='yes'?pct(s.yesOdds||.5):pct(1-(s.yesOdds||.5))}</span></div>
+          <div className="flex justify-between pt-2 border-t border-gray-200"><span className="text-gray-400">Potential payout</span><span className="text-green-600 font-bold">${pay}</span></div>
+        </div>
+        {err&&<p className="text-red-600 text-sm bg-red-50 p-2 rounded-lg mb-3">{err}</p>}
+        <button onClick={function(){if(!user){go('login');return;}if(amt&&parseFloat(amt)>0)setConfirmOpen(true);}} disabled={!amt||parseFloat(amt)<=0} className={"w-full py-3 rounded-xl text-sm font-semibold transition "+(amt&&parseFloat(amt)>0?(side==='yes'?"bg-green-600 hover:bg-green-500 text-white":"bg-red-600 hover:bg-red-500 text-white"):"bg-gray-100 text-gray-400 cursor-not-allowed")}>{!user?'Sign in to bet':(amt?'Bet $'+amt+' on '+side.toUpperCase():'Enter amount')}</button>
+        </>}
+      </div></div>
+    </div>
+    {/* Confirm */}
+    {confirmOpen && <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{background:'rgba(0,0,0,.25)',backdropFilter:'blur(4px)'}}>
+      <div className="bg-white border border-gray-200 rounded-2xl p-6 max-w-md w-full shadow-xl fade-in">
+        <h3 className="text-lg font-bold text-gray-900 mb-2">Confirm Bet</h3>
+        <p className="text-sm text-gray-500 mb-4">Betting <span className="text-gray-900 font-semibold">${amt}</span> on <span className={side==='yes'?'text-green-600':'text-red-600'}>{side.toUpperCase()}</span>:</p>
+        <p className="text-sm text-gray-900 font-medium bg-gray-50 rounded-xl p-3 mb-5">{s.question}</p>
+        <div className="flex gap-3">
+          <button onClick={function(){setConfirmOpen(false)}} className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 py-2.5 rounded-xl text-sm font-medium">Cancel</button>
+          <button onClick={doBet} className={"flex-1 py-2.5 rounded-xl text-sm font-semibold text-white "+(side==='yes'?"bg-green-600":"bg-red-600")}>Confirm</button>
+        </div>
+      </div>
+    </div>}
+  </div>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CREATE PAGE
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var CreatePage = function(props) {
+  var go=props.go, user=props.user;
+  var [step,setStep]=useState(1);
+  var [f,setF]=useState({q:'',cat:'Politics',thr:100000,dl:'',desc:''});
+  var [done,setDone]=useState(false);
+  var [err,setErr]=useState('');
+  if(!user) return <div className="max-w-md mx-auto px-4 pt-28 text-center"><p className="text-gray-500 mb-4">Sign in to create a survey.</p><button onClick={function(){go('login')}} className="bg-blue-600 text-white px-6 py-2.5 rounded-xl text-sm font-medium">Sign In</button></div>;
+  var thrs=[{v:50000,l:'$50K',d:'Quick (~1K)'},{v:100000,l:'$100K',d:'Standard (~5K)'},{v:500000,l:'$500K',d:'Large (~25K)'},{v:1000000,l:'$1M',d:'National (~50K+)'}];
+  var submit=function(){
+    var s = dbCreateSurvey(user.id, f.q, f.cat, f.desc, f.thr, f.dl);
+    setDone(true);
+  };
+  if(done) return <div className="max-w-2xl mx-auto px-4 pt-28 pb-16 text-center fade-in">
+    <div className="w-14 h-14 rounded-full bg-green-50 flex items-center justify-center mx-auto mb-5"><I n="check" s={28} c="text-green-600"/></div>
+    <h2 className="text-2xl font-bold text-gray-900 mb-3">Survey Submitted!</h2>
+    <p className="text-gray-500 mb-8">Pending admin approval. Once approved, people can start betting.</p>
+    <div className="card p-5 text-left mb-8"><p className="text-xs text-gray-400 mb-1">Question</p><p className="text-gray-900 font-medium">{f.q}</p></div>
+    <div className="flex gap-3 justify-center"><button onClick={function(){go('market')}} className="bg-blue-600 text-white px-6 py-2.5 rounded-xl text-sm font-medium">Markets</button><button onClick={function(){setDone(false);setStep(1);setF({q:'',cat:'Politics',thr:100000,dl:'',desc:''});}} className="bg-gray-100 text-gray-700 px-6 py-2.5 rounded-xl text-sm font-medium">Create Another</button></div>
+  </div>;
+  return <div className="max-w-2xl mx-auto px-4 pt-20 pb-16 fade-in">
+    <h1 className="text-2xl font-bold text-gray-900 mb-1">Create a Survey</h1>
+    <p className="text-gray-500 text-sm mb-6">Submit for admin review. Approved surveys go live.</p>
+    <div className="flex items-center gap-2 mb-6">{[1,2,3].map(function(s){return <React.Fragment key={s}><div className={"w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold "+(step>=s?"bg-blue-600 text-white":"bg-gray-100 text-gray-400")}>{s}</div>{s<3&&<div className={"w-10 h-0.5 "+(step>s?"bg-blue-600":"bg-gray-200")}/>}</React.Fragment>;})}</div>
+    {step===1&&<div className="space-y-5">
+      <div><label className="text-sm font-medium text-gray-700 mb-1 block">Question</label><textarea value={f.q} onChange={function(e){setF(Object.assign({},f,{q:e.target.value}))}} placeholder='e.g. "Do a majority of Americans support universal basic income?"' className="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm resize-none" rows={3}/></div>
+      <div><label className="text-sm font-medium text-gray-700 mb-1 block">Category</label><div className="flex flex-wrap gap-2">{CATS.filter(function(c){return c!=='All';}).map(function(c){return <button key={c} onClick={function(){setF(Object.assign({},f,{cat:c}))}} className={"px-3 py-1.5 rounded-lg text-sm font-medium transition "+(f.cat===c?"bg-blue-600 text-white":"bg-gray-50 text-gray-500 border border-gray-200")}>{c}</button>;})}</div></div>
+      <div><label className="text-sm font-medium text-gray-700 mb-1 block">Description (optional)</label><textarea value={f.desc} onChange={function(e){setF(Object.assign({},f,{desc:e.target.value}))}} placeholder="Context..." className="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm resize-none" rows={2}/></div>
+      <button onClick={function(){if(f.q.length>10)setStep(2)}} disabled={f.q.length<=10} className={"w-full py-2.5 rounded-xl text-sm font-semibold transition "+(f.q.length>10?"bg-blue-600 text-white":"bg-gray-100 text-gray-400 cursor-not-allowed")}>Continue</button>
+    </div>}
+    {step===2&&<div className="space-y-5">
+      <div><label className="text-sm font-medium text-gray-700 mb-2 block">Funding Goal</label><div className="grid grid-cols-2 gap-3">{thrs.map(function(t){return <button key={t.v} onClick={function(){setF(Object.assign({},f,{thr:t.v}))}} className={"p-4 rounded-xl text-left transition border "+(f.thr===t.v?"bg-blue-50 border-blue-300":"bg-white border-gray-200")}><div className={"text-lg font-bold "+(f.thr===t.v?"text-blue-600":"text-gray-400")}>{t.l}</div><div className="text-xs mt-1 text-gray-400">{t.d}</div></button>;})}</div></div>
+      <div><label className="text-sm font-medium text-gray-700 mb-1 block">Deadline</label><input type="date" value={f.dl} onChange={function(e){setF(Object.assign({},f,{dl:e.target.value}))}} className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm"/></div>
+      <div className="flex gap-3"><button onClick={function(){setStep(1)}} className="flex-1 bg-gray-100 text-gray-700 py-2.5 rounded-xl text-sm font-medium">← Back</button><button onClick={function(){if(f.dl)setStep(3)}} className="flex-1 bg-blue-600 text-white py-2.5 rounded-xl text-sm font-semibold">Continue</button></div>
+    </div>}
+    {step===3&&<div className="space-y-5">
+      <h3 className="text-lg font-bold text-gray-900">Review</h3>
+      <div className="card p-5 space-y-3"><div><span className="text-xs text-gray-400">Question</span><p className="text-gray-900 font-medium">{f.q}</p></div><div className="grid grid-cols-2 gap-3"><div><span className="text-xs text-gray-400">Category</span><p className="text-gray-900">{f.cat}</p></div><div><span className="text-xs text-gray-400">Goal</span><p className="text-gray-900">{fmt(f.thr)}</p></div></div><div><span className="text-xs text-gray-400">Deadline</span><p className="text-gray-900">{f.dl}</p></div></div>
+      <div className="flex gap-3"><button onClick={function(){setStep(2)}} className="flex-1 bg-gray-100 text-gray-700 py-2.5 rounded-xl text-sm font-medium">← Back</button><button onClick={submit} className="flex-1 bg-green-600 hover:bg-green-500 text-white py-2.5 rounded-xl text-sm font-semibold">Submit for Review</button></div>
+    </div>}
+  </div>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   WALLET
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var WalletPage = function(props) {
+  var user=props.user, go=props.go, setSel=props.setSel;
+  if(!user) return <div className="max-w-md mx-auto px-4 pt-28 text-center"><p className="text-gray-500 mb-4">Sign in to see your portfolio.</p><button onClick={function(){go('login')}} className="bg-blue-600 text-white px-6 py-2.5 rounded-xl text-sm font-medium">Sign In</button></div>;
+  var bets = dbGetMyBets(user.id);
+  var totInv = bets.reduce(function(s,b){return s+b.amount;},0);
+  return <div className="max-w-5xl mx-auto px-4 pt-20 pb-16 fade-in">
+    <h1 className="text-2xl font-bold text-gray-900 mb-6">Your Portfolio</h1>
+    <div className="grid grid-cols-3 gap-4 mb-8">
+      <div className="card p-4"><I n="wallet" s={16} c="text-gray-400 mb-1"/><div className="text-xl font-bold text-gray-900">{fmt(user.balance)}</div><div className="text-xs text-gray-400">Balance</div></div>
+      <div className="card p-4"><I n="chart" s={16} c="text-gray-400 mb-1"/><div className="text-xl font-bold text-gray-900">{bets.length}</div><div className="text-xs text-gray-400">Bets</div></div>
+      <div className="card p-4"><I n="dollar" s={16} c="text-gray-400 mb-1"/><div className="text-xl font-bold text-gray-900">{fmt(totInv)}</div><div className="text-xs text-gray-400">Invested</div></div>
+    </div>
+    <h2 className="text-lg font-semibold text-gray-900 mb-3">Your Bets</h2>
+    {bets.length===0?<div className="card p-8 text-center text-gray-400">No bets yet. <button onClick={function(){go('market')}} className="text-blue-600 font-medium">Explore markets</button></div>:
+    <div className="space-y-3">{bets.map(function(b){return <div key={b.id} onClick={function(){setSel(b.surveyId);go('detail');}} className="card p-4 cursor-pointer">
+      <div className="flex items-start justify-between mb-2"><p className="text-sm text-gray-900 font-medium flex-1 pr-4">{b.question}</p><Badge c={b.side==='yes'?'green':'red'}>{b.side.toUpperCase()}</Badge></div>
+      <div className="flex gap-3 text-xs text-gray-400"><span>Bet: ${b.amount}</span><span>At: {pct(b.side==='yes'?b.oddsAtBet:1-b.oddsAtBet)}</span><span>Now: {pct(b.side==='yes'?b.currentOdds:1-b.currentOdds)}</span>{b.surveyStatus==='resolved'&&<Badge c={b.result.toLowerCase().indexOf(b.side)===0?'green':'red'}>{b.result}</Badge>}</div>
+    </div>;})}</div>}
+  </div>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ADMIN DASHBOARD
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+var AdminPage = function(props) {
+  var user=props.user, refresh=props.refresh;
+  var [tab,setTab]=useState('pending');
+  var [editId,setEditId]=useState(null);
+  var [editMode,setEditMode]=useState('');
+  var [firmVal,setFirmVal]=useState('');
+  var [resultVal,setResultVal]=useState('');
+  var [tick,setTick]=useState(0);
+  if(!user||user.role!=='admin') return <div className="max-w-md mx-auto px-4 pt-28 text-center text-gray-500">Admin only.</div>;
+
+  var stats = dbGetStats();
+  var allSurveys = dbGetSurveys({});
+  var users = dbGetAllUsers();
+  var pending = allSurveys.filter(function(s){return s.status==='pending';});
+  var active = allSurveys.filter(function(s){return s.status==='active'||s.status==='funded';});
+  var resolved = allSurveys.filter(function(s){return s.status==='resolved';});
+  var rejected = allSurveys.filter(function(s){return s.status==='rejected';});
+
+  var doAction = function(id, updates) {
+    dbAdminUpdate(id, updates);
+    setEditId(null); setFirmVal(''); setResultVal(''); setEditMode('');
+    refresh();
+    setTick(function(t){return t+1;});
+  };
+
+  return <div className="max-w-6xl mx-auto px-4 pt-20 pb-16 fade-in">
+    <h1 className="text-2xl font-bold text-gray-900 mb-1">Admin Dashboard</h1>
+    <p className="text-gray-500 text-sm mb-6">Approve surveys, assign firms, resolve markets, manage users.</p>
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
+      {[{l:"Users",v:stats.users},{l:"Surveys",v:stats.totalSurveys},{l:"Bets",v:stats.totalBets},{l:"Pool",v:fmt(stats.totalPool)},{l:"Pending",v:stats.pending}].map(function(s){return <div key={s.l} className="card p-3 text-center"><div className="text-lg font-bold text-gray-900">{s.v}</div><div className="text-xs text-gray-400">{s.l}</div></div>;})}
+    </div>
+    <div className="flex gap-1 mb-5 overflow-x-auto">
+      {[{id:'pending',l:'Pending ('+pending.length+')'},{id:'active',l:'Active ('+active.length+')'},{id:'resolved',l:'Resolved ('+resolved.length+')'},{id:'rejected',l:'Rejected ('+rejected.length+')'},{id:'users',l:'Users ('+users.length+')'}].map(function(t){return <button key={t.id} onClick={function(){setTab(t.id)}} className={"px-3 py-2 text-sm font-medium rounded-lg transition whitespace-nowrap "+(tab===t.id?"bg-blue-50 text-blue-600":"text-gray-400 hover:text-gray-600")}>{t.l}</button>;})}
+    </div>
+
+    {tab==='pending'&&<div className="space-y-3">
+      {pending.length===0&&<div className="card p-8 text-center text-gray-400">No pending surveys.</div>}
+      {pending.map(function(s){return <div key={s.id} className="card p-5">
+        <div className="flex gap-2 mb-2"><Badge c="purple">{s.category}</Badge><Badge c="yellow">Pending</Badge></div>
+        <h3 className="text-gray-900 font-semibold mb-1">{s.question}</h3>
+        {s.description&&<p className="text-sm text-gray-500 mb-2">{s.description}</p>}
+        <div className="flex gap-2 text-xs text-gray-400 mb-3"><span>By: {s.creatorName}</span><span>Goal: {fmt(s.threshold)}</span><span>Deadline: {s.deadline}</span></div>
+        <div className="flex gap-2">
+          <button onClick={function(){doAction(s.id,{status:'active'})}} className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-lg text-sm font-medium">Approve</button>
+          <button onClick={function(){doAction(s.id,{status:'rejected'})}} className="bg-red-50 hover:bg-red-100 text-red-700 px-4 py-2 rounded-lg text-sm font-medium">Reject</button>
+        </div>
+      </div>;})}
+    </div>}
+
+    {tab==='active'&&<div className="space-y-3">
+      {active.length===0&&<div className="card p-8 text-center text-gray-400">No active surveys.</div>}
+      {active.map(function(s){return <div key={s.id} className="card p-5">
+        <div className="flex gap-2 mb-2"><Badge c="purple">{s.category}</Badge><Badge c={s.status==='funded'?'green':'blue'}>{s.status==='funded'?'Funded':'Active'}</Badge>{s.surveyFirm&&<Badge c="gray">{s.surveyFirm}</Badge>}</div>
+        <h3 className="text-gray-900 font-semibold mb-1">{s.question}</h3>
+        <div className="text-xs text-gray-400 mb-3">Pool: {fmt(s.poolSize||0)} / {fmt(s.threshold)} · {s.totalBets||0} bets · YES: {pct(s.yesOdds||.5)}</div>
+        <ProgBar val={s.poolSize||0} max={s.threshold}/>
+        <div className="flex gap-2 mt-3">
+          {!s.surveyFirm&&<button onClick={function(){setEditId(s.id);setEditMode('firm');}} className="bg-blue-50 hover:bg-blue-100 text-blue-700 px-3 py-1.5 rounded-lg text-sm font-medium">Assign Firm</button>}
+          <button onClick={function(){setEditId(s.id);setEditMode('resolve');}} className="bg-purple-50 hover:bg-purple-100 text-purple-700 px-3 py-1.5 rounded-lg text-sm font-medium">Resolve</button>
+        </div>
+        {editId===s.id&&editMode==='firm'&&<div className="mt-3 flex gap-2"><input value={firmVal} onChange={function(e){setFirmVal(e.target.value)}} placeholder="e.g. Gallup, YouGov, Pew" className="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm"/><button onClick={function(){doAction(s.id,{surveyFirm:firmVal})}} className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm">Save</button><button onClick={function(){setEditId(null);setEditMode('');}} className="text-gray-400 text-sm">Cancel</button></div>}
+        {editId===s.id&&editMode==='resolve'&&<div className="mt-3 flex gap-2"><input value={resultVal} onChange={function(e){setResultVal(e.target.value)}} placeholder='e.g. "YES — 62%" or "NO — 38%"' className="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm"/><button onClick={function(){doAction(s.id,{result:resultVal})}} className="bg-purple-600 text-white px-4 py-2 rounded-lg text-sm">Resolve</button><button onClick={function(){setEditId(null);setEditMode('');}} className="text-gray-400 text-sm">Cancel</button></div>}
+      </div>;})}
+    </div>}
+
+    {tab==='resolved'&&<div className="space-y-3">
+      {resolved.length===0&&<div className="card p-8 text-center text-gray-400">None yet.</div>}
+      {resolved.map(function(s){return <div key={s.id} className="card p-4"><div className="flex gap-2 mb-1"><Badge c="purple">{s.category}</Badge><Badge c={s.result.toLowerCase().indexOf('yes')===0?'green':'red'}>{s.result}</Badge></div><h3 className="text-gray-900 font-medium text-sm">{s.question}</h3><div className="text-xs text-gray-400 mt-1">Pool: {fmt(s.poolSize||0)} · {s.surveyFirm||'N/A'}</div></div>;})}
+    </div>}
+
+    {tab==='rejected'&&<div className="space-y-3">
+      {rejected.length===0&&<div className="card p-8 text-center text-gray-400">None.</div>}
+      {rejected.map(function(s){return <div key={s.id} className="card p-4 opacity-60"><Badge c="red">Rejected</Badge><h3 className="text-gray-900 font-medium text-sm mt-1">{s.question}</h3></div>;})}
+    </div>}
+
+    {tab==='users'&&<div className="card overflow-hidden">
+      <table className="w-full text-sm"><thead><tr className="bg-gray-50 text-left text-gray-500"><th className="px-4 py-3 font-medium">Name</th><th className="px-4 py-3 font-medium">Email</th><th className="px-4 py-3 font-medium">Role</th><th className="px-4 py-3 font-medium">Balance</th></tr></thead>
+      <tbody>{users.map(function(u){return <tr key={u.id} className="border-t border-gray-100"><td className="px-4 py-3 text-gray-900 font-medium">{u.name}</td><td className="px-4 py-3 text-gray-500">{u.email}</td><td className="px-4 py-3"><Badge c={u.role==='admin'?'blue':'gray'}>{u.role}</Badge></td><td className="px-4 py-3 text-gray-900">{fmt(u.balance)}</td></tr>;})}</tbody></table>
+    </div>}
+
+    <div className="mt-8 card p-4"><button onClick={function(){if(confirm('Delete ALL data? This cannot be undone.')){localStorage.removeItem(DB_KEY);window.location.reload();}}} className="text-red-500 text-sm hover:text-red-700">Reset Database (delete everything)</button></div>
+  </div>;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   APP
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function App() {
+  var [pg,setPg]=useState('home');
+  var [sel,setSel]=useState(null);
+  var [user,setUser]=useState(getSession());
+  var [tick,setTick]=useState(0);
+
+  useEffect(function(){window.scrollTo({top:0,behavior:'smooth'});},[pg]);
+
+  var refresh = function() {
+    if (user) {
+      var fresh = dbGetUser(user.id);
+      if (fresh) { setUser(fresh); setSession(fresh); }
+    }
+    setTick(function(t){return t+1;});
+  };
+
+  var logout = function() { setSession(null); setUser(null); setPg('home'); };
+  var onAuth = function(u) { setUser(u); setSession(u); };
+
+  return <div className="min-h-screen bg-gray-50">
+    <Nav page={pg} go={setPg} user={user} onLogout={logout}/>
+    {pg==='home'&&<HomePage go={setPg} setSel={setSel} user={user} key={'h'+tick}/>}
+    {pg==='market'&&<MarketPage go={setPg} setSel={setSel} key={'m'+tick}/>}
+    {pg==='detail'&&<DetailPage surveyId={sel} go={setPg} user={user} refresh={refresh} key={'d'+sel+tick}/>}
+    {pg==='create'&&<CreatePage go={setPg} user={user}/>}
+    {pg==='wallet'&&<WalletPage user={user} go={setPg} setSel={setSel} key={'w'+tick}/>}
+    {pg==='admin'&&<AdminPage user={user} refresh={refresh} key={'a'+tick}/>}
+    {pg==='login'&&<AuthPage mode="login" go={setPg} onAuth={onAuth}/>}
+    {pg==='register'&&<AuthPage mode="register" go={setPg} onAuth={onAuth}/>}
+    <footer className="border-t border-gray-200 mt-16 py-6 px-4 bg-white">
+      <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
+        <div className="flex items-center gap-2"><div className="w-6 h-6 rounded-md bg-blue-600 flex items-center justify-center"><I n="target" s={12} c="text-white"/></div><span className="text-sm font-semibold text-gray-400">SurveyBet</span></div>
+        <p className="text-xs text-gray-400">Fund real surveys. Bet on real opinions. Get real answers.</p>
+      </div>
+    </footer>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
